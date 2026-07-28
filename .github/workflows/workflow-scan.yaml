@@ -1,0 +1,95 @@
+name: Workflow Scan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pinact:
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # reviewdog が PR 変更ファイル数 300 超過などで git fallback した際に
+      # `git fetch` が失敗するのを防ぐため、insteadOf でトークンを付与する。
+      # 参考: https://github.com/reviewdog/reviewdog/issues/2187
+      - name: Configure git credential for reviewdog fallback
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Suggest action hash pinning
+        id: pinact
+        uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
+        with:
+          skip_push: "true"
+          fix: "false"
+          review: "true"
+          github_token: ${{ github.token }}
+          min_age: "7"
+          reviewdog_fail_level: error
+
+      - name: Unset git credential
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git config --global --unset url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf
+
+      - name: Post PR comments
+        if: failure() && steps.pinact.conclusion == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # reviewdog が review comment を投稿していなければツールエラーと判断しスキップ
+          REVIEW_COMMENTS=$(gh api "/repos/${REPO}/pulls/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | test("pinact"))] | length' 2>/dev/null || echo "0")
+          if [ "$REVIEW_COMMENTS" -eq 0 ]; then
+            echo "::warning::pinact step failed but no review comments were posted — likely a tool error, not violations"
+            exit 0
+          fi
+
+          cat > comment.md <<'MARKDOWN'
+          ## 🔒 `[pinact]` Action hash pinning required
+
+          > [!CAUTION]
+          > このPRに含まれる workflow ファイルに、tag 参照 (例: `uses: actions/checkout@v4`) されている action があります。サプライチェーン攻撃対策として、すべての 3rd party action は **完全な commit SHA で固定** する必要があります。
+
+          > [!TIP]
+          > このPRのレビューコメントに付いた **Apply suggestion** ボタンで一括修正できます。
+
+          <details>
+          <summary>📖 なぜ SHA pin が必要か</summary>
+
+          tag 参照は後から書き換え可能なため、攻撃者が action のリポジトリを侵害した場合に各 PR の CI 上で任意コードを実行されえます (= サプライチェーン攻撃)。完全な commit SHA で固定すれば不変なので、この種の攻撃を遮断できます。
+
+          [GitHub 公式ガイド - Using third-party actions](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-third-party-actions)
+          </details>
+
+          ---
+          <sub>🛡️ このチェックは <a href="https://globis.slack.com/archives/C013MAHJUCB">GDPセキュリティチーム</a> が管理しています</sub>
+          MARKDOWN
+
+          # github-actions[bot] が投稿した [pinact] 識別子のコメントを検索
+          COMMENT_ID=$(gh api "/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("## 🔒 `[pinact]`"))] | first | .id // empty')
+
+          if [ -n "$COMMENT_ID" ]; then
+            echo "Updating existing comment $COMMENT_ID"
+            gh api -X PATCH "/repos/${REPO}/issues/comments/${COMMENT_ID}" \
+              --field body=@comment.md
+          else
+            echo "Creating new comment"
+            gh pr comment -F comment.md "${URL}"
+          fi
