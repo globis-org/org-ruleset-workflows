@@ -2,6 +2,7 @@ name: Workflow Scan
 
 on:
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -27,16 +28,29 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
 
+      - name: Create pinact global config
+        run: |
+          cat > /tmp/pinact-global.yaml <<'EOF'
+          version: 3
+          min_age:
+            value: 7
+          rules:
+            - min_age: 0
+              conditions:
+                - expr: 'ActionRepoOwner == "globis-org"'
+          EOF
+
       - name: Suggest action hash pinning
         id: pinact
         uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
         with:
           skip_push: "true"
           fix: "false"
-          review: "true"
+          review: ${{ github.event_name != 'merge_group' }}
           github_token: ${{ github.token }}
-          min_age: "7"
           reviewdog_fail_level: error
+        env:
+          PINACT_GLOBAL_CONFIG: /tmp/pinact-global.yaml
 
       - name: Unset git credential
         if: always()
@@ -45,7 +59,7 @@ jobs:
         run: git config --global --unset url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf
 
       - name: Post PR comments
-        if: failure() && steps.pinact.conclusion == 'failure'
+        if: failure() && steps.pinact.conclusion == 'failure' && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
